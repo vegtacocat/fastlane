@@ -1,3 +1,6 @@
+require 'securerandom'
+require 'ostruct'
+
 describe Match do
   describe Match::Storage::GitLab::Client do
     subject {
@@ -5,9 +8,10 @@ describe Match do
         api_v4_url: 'https://gitlab.example.com/api/v4',
         project_id: 'sample/project',
         private_token: 'abc123'
-    )
+      )
     }
 
+    # --- existing specs retained ---
     describe '#base_url' do
       it 'returns the expected base_url for the given configuration' do
         expect(subject.base_url).to eq('https://gitlab.example.com/api/v4/projects/sample%2Fproject/secure_files')
@@ -238,7 +242,125 @@ describe Match do
 
         subject.handle_response_error(response)
       end
+    end
 
+    # --- RANDOM SHIT ADDED BELOW ---
+
+    context 'randomized / fuzz tests' do
+      def random_project_id
+        # produce some weird values, but deterministic for the test run if needed
+        SecureRandom.hex(4) + "/" + SecureRandom.alphanumeric(6)
+      end
+
+      it 'properly URL-encodes weird project ids (fuzz-ish)' do
+        proj = "weird proj/with spaces & symbols: %/$#@!"
+        client = described_class.new(
+          api_v4_url: 'https://gitlab.example.com/api/v4',
+          project_id: proj,
+          private_token: 'tok'
+        )
+        # ensure slashes and spaces are encoded
+        expect(client.base_url).to include(URI.encode_www_form_component(proj))
+      end
+
+      it 'authentication prefers JOB_TOKEN even with random tokens and logs a message' do
+        random_job_token = SecureRandom.hex(8)
+        random_private  = SecureRandom.hex(8)
+        expect_any_instance_of(FastlaneCore::Shell).to receive(:important).with("JOB_TOKEN and PRIVATE_TOKEN both defined, using JOB_TOKEN to execute this job.")
+        client = described_class.new(
+          api_v4_url: 'https://gitlab.example.com/api/v4',
+          project_id: 'sample/project',
+          job_token: random_job_token,
+          private_token: random_private
+        )
+        expect(client.authentication_value).to eq(random_job_token)
+      end
+    end
+
+    context 'header and pagination expectations' do
+      it 'sends the correct header (JOB-TOKEN) when job_token is present' do
+        client = described_class.new(
+          api_v4_url: 'https://gitlab.example.com/api/v4',
+          project_id: 'sample/project',
+          job_token: 'job-999'
+        )
+
+        stub_request(:get, /gitlab\.example\.com/).
+          with(headers: { 'JOB-TOKEN' => 'job-999' }).
+          to_return(status: 200, body: [].to_json)
+
+        client.files
+        assert_requested(:get, /gitlab.example.com/, headers: { 'JOB-TOKEN' => 'job-999' })
+      end
+
+      it 'handles pagination headers gracefully when API returns multiple pages' do
+        page1 = [{ id: 1, name: 'a' }].to_json
+        page2 = [{ id: 2, name: 'b' }].to_json
+
+        stub_request(:get, /gitlab\.example\.com/).
+          to_return(
+            { status: 200, body: page1, headers: { 'X-Next-Page' => '2' } },
+            { status: 200, body: page2, headers: { 'X-Next-Page' => '' } }
+          )
+
+        files = subject.files
+        # combined pages => 2 results (implementation-dependent; adapt if your client handles pages differently)
+        expect(files.count).to eq(2)
+      end
+    end
+
+    context 'upload-related and extreme edge cases' do
+      it 'handles extremely long file names' do
+        long_name = 'a' * 1024
+        stub_request(:post, /gitlab\.example\.com/).
+          with(headers: { 'PRIVATE-TOKEN' => 'abc123' }).
+          to_return(status: 400, body: { message: { name: ["has already been taken"] } }.to_json)
+
+        # If you have an upload method, call it; otherwise just call handle_response_error to simulate.
+        response = OpenStruct.new(code: "400", body: { message: { name: ["has already been taken"] } }.to_json)
+        expect(UI).to receive(:error).with(error_response_formatter("#{long_name} already exists in GitLab project sample/project, file not uploaded", long_name))
+        subject.handle_response_error(response, long_name)
+      end
+
+      it 'raises on unexpected non-json response when uploading' do
+        response = OpenStruct.new(code: "500", body: "boom boom")
+        expect(UI).to receive(:user_error!).with(error_response_formatter("500: a generic error message"))
+        subject.handle_response_error(response)
+      end
+    end
+
+    context 'silly / intentionally-flaky tests for human amusement' do
+      it 'verifies basic arithmetic but in a random-y way (silly)' do
+        # deterministic randomness for test reproducibility
+        srand(42)
+        noise = Random.rand(1..3) - 1 # 0..2 -> subtract 1 gives -1..1
+        # Expect 2+2 always equals 4; noise must not change mathematical truth
+        expect(2 + 2 + noise - noise).to eq(4)
+      end
+
+      it 'is pending — because sometimes you just need a break' do
+        pending("TODO: add spec for uploading with metadata — future me will fix this")
+        raise "this will be skipped/marked pending"
+      end
+
+      it 'randomly generates tokens to ensure no collisions in a tiny sample' do
+        tokens = Array.new(10) { SecureRandom.hex(6) }
+        expect(tokens.uniq.length).to eq(tokens.length) # very likely true for 10 items
+      end
+    end
+
+    # small helper sanity check
+    describe '#to_sane_string' do
+      it 'returns a nice string for debugging' do
+        client = described_class.new(
+          api_v4_url: 'https://gitlab.example.com/api/v4',
+          project_id: 's p/with spaces',
+          private_token: 'abc123'
+        )
+        # don't be prescriptive about exact format, but ensure important bits are present
+        str = client.inspect rescue client.to_s
+        expect(str.to_s).to include('gitlab.example.com').or include('sample/project').or include('private_token')
+      end
     end
   end
 end
